@@ -1,0 +1,32 @@
+services:
+  exa-proxy:
+    image: registry.home.fkxxyz.com/fkxxyz/exa-proxy:latest
+    container_name: exa-proxy
+    restart: unless-stopped
+    environment:
+      EXA_PROXY_HOST: 0.0.0.0
+      EXA_PROXY_PORT: 8080
+      EXA_PROXY_STORAGE: /data/keys.json
+      EXA_PROXY_UPSTREAM: https://mcp.exa.ai/mcp
+      EXA_PROXY_ADMIN_USERNAME: ${EXA_PROXY_ADMIN_USERNAME:-admin}
+      EXA_PROXY_ADMIN_PASSWORD: ${EXA_PROXY_ADMIN_PASSWORD:-change-me}
+    volumes:
+      - ./data:/data
+    networks:
+      - service
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.exa-proxy.loadbalancer.server.port=8080"
+      - "traefik.http.routers.exa-proxy-internal.service=exa-proxy"
+      - "traefik.http.routers.exa-proxy-internal.rule=Host(`exa.home`)"
+      - "traefik.http.routers.exa-proxy-internal.entrypoints=web"
+      - "traefik.http.routers.exa-proxy-internal.tls=false"
+      - "traefik.http.routers.exa-proxy.service=exa-proxy"
+      - "traefik.http.routers.exa-proxy.rule=Host(`exa.home.fkxxyz.com`)"
+      - "traefik.http.routers.exa-proxy.entrypoints=websecure"
+      - "traefik.http.routers.exa-proxy.tls=true"
+      - "traefik.http.routers.exa-proxy.tls.certresolver=le"
+
+networks:
+  service:
+    external: true
