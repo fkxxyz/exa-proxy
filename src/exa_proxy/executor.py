@@ -53,45 +53,30 @@ class ProxyExecutor:
         执行代理请求，自动选择 key 并处理重试
 
         策略：
-        1. 如果有可用 key，使用 key 并在失败时切换
-        2. 如果所有 key 都不可用，fallback 到无 key 模式（使用 Exa 免费额度）
-        3. 如果从未添加过 key，直接使用无 key 模式
+        1. 优先使用可用 key，失败时切换其他 key
+        2. 所有 key 冷却时，fallback 到无 key 模式（免费额度）
+        3. 无 key 也冷却时，等待后重新尝试（优先尝试 key）
+        4. 无限重试直到成功，确保所有请求都能完成
 
-        返回: (status_code, response_headers, response_body)
+        返回：(status_code, response_headers, response_body)
         """
-        attempt = 0
         has_any_keys = len(self.key_manager.list_keys()) > 0
-        tried_fallback = False
 
-        while attempt < self.max_retries:
-            attempt += 1
-
+        while True:  # 无限重试直到成功
             # 选择可用的 key
             api_key_obj = self.key_manager.choose_key()
-            
-            # 如果没有可用 key
+
+            # 如果没有可用 key，fallback 到无 key 模式
             if not api_key_obj:
-                # 如果已经尝试过 fallback，等待后重试
-                if tried_fallback:
-                    logger.warning(
-                        f"Fallback also failed, attempt {attempt}/{self.max_retries}, waiting..."
-                    )
-                    await asyncio.sleep(self.retry_wait_seconds)
-                    continue
-                
-                # 尝试 fallback 到无 key 模式
                 if has_any_keys:
                     logger.warning(
-                        "All keys unavailable, falling back to no-key mode (free tier)"
+                        "All keys in cooldown, falling back to no-key mode (free tier)"
                     )
                 else:
-                    logger.info(
-                        "No keys configured, using no-key mode (free tier)"
-                    )
-                
-                tried_fallback = True
+                    logger.debug("No keys configured, using no-key mode (free tier)")
+
                 url = self._build_url_without_key(path)
-                
+
                 try:
                     async with httpx.AsyncClient(timeout=30.0) as client:
                         response = await client.request(
@@ -100,36 +85,37 @@ class ProxyExecutor:
                             headers=headers,
                             content=body,
                         )
-                    
+
                     status = response.status_code
-                    
+
                     # 成功
                     if 200 <= status < 300:
-                        logger.info(f"Request succeeded with no-key mode (status={status})")
+                        logger.info(
+                            f"Request succeeded with no-key mode (status={status})"
+                        )
                         return (
                             status,
                             dict(response.headers),
                             response.content,
                         )
-                    
-                    # 429：免费额度耗尽，等待后重试
+
+                    # 429：免费额度耗尽，等待后重试（优先尝试 key）
                     if status == 429:
                         logger.warning(
-                            f"Free tier rate limited (429), waiting before retry..."
+                            f"Free tier rate limited (429), waiting {self.retry_wait_seconds}s before retry..."
                         )
                         await asyncio.sleep(self.retry_wait_seconds)
                         continue
-                    
-                    # 其他错误直接返回错误
-                    logger.error(f"No-key mode failed with status {status}")
-                    return (
-                        status,
-                        dict(response.headers),
-                        response.content,
+
+                    # 其他错误，等待后重试
+                    logger.warning(
+                        f"No-key mode failed with status {status}, retrying..."
                     )
-                
+                    await asyncio.sleep(self.retry_wait_seconds)
+                    continue
+
                 except Exception as e:
-                    logger.error(f"No-key mode request failed: {e}")
+                    logger.warning(f"No-key mode request failed: {e}, retrying...")
                     await asyncio.sleep(self.retry_wait_seconds)
                     continue
 
@@ -146,6 +132,30 @@ class ProxyExecutor:
                     )
 
                 status = response.status_code
+                content = response.content
+
+                # 检测响应体中是否包含 429 错误信息（Exa MCP 返回 HTTP 200 + 错误消息）
+                # 关键特征：MCP 协议使用 isError: true 标记错误响应
+                if status == 200 and content:
+                    try:
+                        content_str = content.decode("utf-8")
+                        # 检查 MCP 错误响应格式：isError: true 且包含特定错误前缀
+                        # 格式：{"result":{"content":[{"type":"text","text":"web_search_exa error (429): ..."}],"isError":true},"jsonrpc":"2.0","id":X}
+                        if (
+                            '"isError":true' in content_str
+                            and "web_search_exa error (429)" in content_str
+                        ):
+                            logger.warning(
+                                f"Key {api_key_obj.name} rate limited (detected in response body), "
+                                f"marking cooldown and retrying..."
+                            )
+                            self.key_manager.mark_key_failure(
+                                api_key_obj.id,
+                                status_code=429,
+                            )
+                            continue
+                    except UnicodeDecodeError:
+                        pass
 
                 # 成功
                 if 200 <= status < 300:
@@ -156,7 +166,7 @@ class ProxyExecutor:
                     return (
                         status,
                         dict(response.headers),
-                        response.content,
+                        content,
                     )
 
                 # 429 或 5xx：标记失败，切换 key 重试
@@ -198,8 +208,3 @@ class ProxyExecutor:
                 )
                 self.key_manager.mark_key_failure(api_key_obj.id)
                 continue
-
-        # 所有重试都失败
-        raise RuntimeError(
-            f"All {self.max_retries} retry attempts failed"
-        )
