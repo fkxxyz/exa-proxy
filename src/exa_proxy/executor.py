@@ -42,6 +42,28 @@ class ProxyExecutor:
         """构造不带 key 的 URL（使用免费额度）"""
         return f"{self.upstream_base_url}{path}"
 
+    @staticmethod
+    def _is_mcp_rate_limit_error(content: bytes) -> bool:
+        """检测 MCP 响应体是否为限流错误。
+
+        Exa MCP 在限流时返回 HTTP 200 + JSON body，其中 isError: true
+        且文本包含 "rate limit" 相关关键词。
+        """
+        if not content:
+            return False
+        try:
+            content_str = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        if '"isError": true' not in content_str and '"isError":true' not in content_str:
+            return False
+        if (
+            "rate limit" not in content_str.lower()
+            and "free mcp" not in content_str.lower()
+        ):
+            return False
+        return True
+
     async def execute(
         self,
         method: str,
@@ -87,6 +109,15 @@ class ProxyExecutor:
                         )
 
                     status = response.status_code
+
+                    # 检测响应体中是否包含限流错误（Exa MCP 返回 HTTP 200 + 错误消息）
+                    if self._is_mcp_rate_limit_error(response.content):
+                        logger.warning(
+                            "Free tier rate limited (detected in response body), "
+                            f"waiting {self.retry_wait_seconds}s before retry..."
+                        )
+                        await asyncio.sleep(self.retry_wait_seconds)
+                        continue
 
                     # 成功
                     if 200 <= status < 300:
@@ -134,28 +165,17 @@ class ProxyExecutor:
                 status = response.status_code
                 content = response.content
 
-                # 检测响应体中是否包含 429 错误信息（Exa MCP 返回 HTTP 200 + 错误消息）
-                # 关键特征：MCP 协议使用 isError: true 标记错误响应
-                if status == 200 and content:
-                    try:
-                        content_str = content.decode("utf-8")
-                        # 检查 MCP 错误响应格式：isError: true 且包含特定错误前缀
-                        # 格式：{"result":{"content":[{"type":"text","text":"web_search_exa error (429): ..."}],"isError":true},"jsonrpc":"2.0","id":X}
-                        if (
-                            '"isError":true' in content_str
-                            and "web_search_exa error (429)" in content_str
-                        ):
-                            logger.warning(
-                                f"Key {api_key_obj.name} rate limited (detected in response body), "
-                                f"marking cooldown and retrying..."
-                            )
-                            self.key_manager.mark_key_failure(
-                                api_key_obj.id,
-                                status_code=429,
-                            )
-                            continue
-                    except UnicodeDecodeError:
-                        pass
+                # 检测响应体中是否包含限流错误（Exa MCP 返回 HTTP 200 + 错误消息）
+                if self._is_mcp_rate_limit_error(content):
+                    logger.warning(
+                        f"Key {api_key_obj.name} rate limited (detected in response body), "
+                        f"marking cooldown and retrying..."
+                    )
+                    self.key_manager.mark_key_failure(
+                        api_key_obj.id,
+                        status_code=429,
+                    )
+                    continue
 
                 # 成功
                 if 200 <= status < 300:
