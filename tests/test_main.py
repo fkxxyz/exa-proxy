@@ -4,7 +4,7 @@ from exa_proxy.main import create_app
 from exa_proxy.executor import ProxyExecutor
 
 
-async def _fake_execute(self, method, path, headers=None, body=None):
+async def _fake_execute(self, method, path, headers=None, body=None, should_abort=None):
     return 200, {"content-type": "application/json"}, b'{"ok":true}'
 
 

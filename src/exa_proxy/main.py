@@ -15,7 +15,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import uvicorn
 
 from .api import create_api_router
-from .executor import ProxyExecutor
+from .executor import ExecutionAbortedError, ProxyExecutor
 from .key_manager import KeyManager
 
 logging.basicConfig(
@@ -645,6 +645,9 @@ def create_app() -> FastAPI:
         headers = dict(request.headers)
         body = await request.body()
 
+        async def should_abort() -> bool:
+            return await request.is_disconnected()
+
         # 移除 Host header 避免冲突
         headers.pop("host", None)
 
@@ -654,6 +657,7 @@ def create_app() -> FastAPI:
                 path=path,
                 headers=headers,
                 body=body if body else None,
+                should_abort=should_abort,
             )
 
             # 处理 SSE 响应
@@ -676,6 +680,10 @@ def create_app() -> FastAPI:
                 status_code=status,
                 headers=resp_headers,
             )
+
+        except ExecutionAbortedError as e:
+            logger.info(f"Proxy request aborted: {e}")
+            return Response(status_code=499)
 
         except Exception as e:
             logger.error(f"Proxy error: {e}")
